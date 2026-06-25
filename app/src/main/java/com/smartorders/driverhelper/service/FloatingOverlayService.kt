@@ -9,7 +9,6 @@ import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.WindowManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -20,6 +19,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -48,6 +48,7 @@ class FloatingOverlayService : Service(), LifecycleOwner, SavedStateRegistryOwne
     private var floatingButtonView: ComposeView? = null
     private var panelView: ComposeView? = null
     private var isPanelOpen = false
+    private var buttonParams: WindowManager.LayoutParams? = null
 
     private val lifecycleRegistry = LifecycleRegistry(this)
     private val savedStateRegistryController = SavedStateRegistryController.create(this)
@@ -85,19 +86,18 @@ class FloatingOverlayService : Service(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun buildNotification(): Notification {
         return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("Smart Orders")
-            .setContentText("Floating overlay active")
+            .setContentTitle("Smart Orders Active")
+            .setContentText("Monitoring Jeeny trips")
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .build()
     }
 
-    private fun getWindowType(): Int {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+    private fun getWindowType(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         else
             @Suppress("DEPRECATION")
             WindowManager.LayoutParams.TYPE_PHONE
-    }
 
     private fun showFloatingButton() {
         val params = WindowManager.LayoutParams(
@@ -112,41 +112,35 @@ class FloatingOverlayService : Service(), LifecycleOwner, SavedStateRegistryOwne
             x = 16
             y = 300
         }
+        buttonParams = params
 
         val view = ComposeView(this).apply {
             setViewTreeLifecycleOwner(this@FloatingOverlayService)
             setViewTreeSavedStateRegistryOwner(this@FloatingOverlayService)
         }
 
-        var offsetX = 0f
-        var offsetY = 0f
-
         view.setContent {
             val autoAccept by AppState.autoAccept.collectAsState()
             SmartOrdersTheme {
                 Box(
                     modifier = Modifier
-                        .size(56.dp)
+                        .size(60.dp)
                         .pointerInput(Unit) {
                             var totalDragX = 0f
                             var totalDragY = 0f
                             detectDragGestures(
-                                onDragStart = {
-                                    totalDragX = 0f
-                                    totalDragY = 0f
-                                },
+                                onDragStart = { totalDragX = 0f; totalDragY = 0f },
                                 onDrag = { change, dragAmount ->
                                     change.consume()
                                     totalDragX += dragAmount.x
                                     totalDragY += dragAmount.y
                                     params.x = (params.x - dragAmount.x.toInt()).coerceAtLeast(0)
                                     params.y = (params.y + dragAmount.y.toInt()).coerceAtLeast(0)
-                                    windowManager.updateViewLayout(view, params)
+                                    try { windowManager.updateViewLayout(view, params) } catch (_: Exception) {}
                                 },
                                 onDragEnd = {
-                                    // if drag was small, treat as tap
-                                    if (kotlin.math.abs(totalDragX) < 10 && kotlin.math.abs(totalDragY) < 10) {
-                                        togglePanel(params)
+                                    if (kotlin.math.abs(totalDragX) < 12 && kotlin.math.abs(totalDragY) < 12) {
+                                        togglePanel()
                                     }
                                 }
                             )
@@ -157,12 +151,21 @@ class FloatingOverlayService : Service(), LifecycleOwner, SavedStateRegistryOwne
                         ),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(
-                        text = if (autoAccept) "ON" else "OFF",
-                        color = Color.White,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = if (autoAccept) "ON" else "OFF",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        if (autoAccept) {
+                            Box(
+                                modifier = Modifier
+                                    .size(6.dp)
+                                    .background(Color(0xFF22C55E), CircleShape)
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -171,18 +174,15 @@ class FloatingOverlayService : Service(), LifecycleOwner, SavedStateRegistryOwne
         windowManager.addView(view, params)
     }
 
-    private fun togglePanel(buttonParams: WindowManager.LayoutParams) {
-        if (isPanelOpen) {
-            closePanel()
-        } else {
-            openPanel(buttonParams)
-        }
+    private fun togglePanel() {
+        if (isPanelOpen) closePanel() else openPanel()
     }
 
-    private fun openPanel(buttonParams: WindowManager.LayoutParams) {
+    private fun openPanel() {
         if (isPanelOpen) return
         isPanelOpen = true
 
+        val bp = buttonParams ?: return
         val panelParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -192,7 +192,7 @@ class FloatingOverlayService : Service(), LifecycleOwner, SavedStateRegistryOwne
         ).apply {
             gravity = Gravity.TOP or Gravity.END
             x = 16
-            y = buttonParams.y + 70
+            y = bp.y + 72
         }
 
         val panel = ComposeView(this).apply {
@@ -204,15 +204,16 @@ class FloatingOverlayService : Service(), LifecycleOwner, SavedStateRegistryOwne
             val autoAccept by AppState.autoAccept.collectAsState()
             SmartOrdersTheme {
                 Card(
-                    modifier = Modifier.width(200.dp),
+                    modifier = Modifier.width(220.dp),
                     colors = CardDefaults.cardColors(containerColor = Surface),
-                    shape = RoundedCornerShape(14.dp),
-                    elevation = CardDefaults.cardElevation(8.dp)
+                    shape = RoundedCornerShape(16.dp),
+                    elevation = CardDefaults.cardElevation(12.dp)
                 ) {
                     Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        // Header
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -228,10 +229,16 @@ class FloatingOverlayService : Service(), LifecycleOwner, SavedStateRegistryOwne
                                 onClick = { closePanel() },
                                 modifier = Modifier.size(24.dp)
                             ) {
-                                Icon(Icons.Default.Close, contentDescription = "Close", tint = OnSurfaceVariant, modifier = Modifier.size(16.dp))
+                                Icon(
+                                    Icons.Default.Close,
+                                    contentDescription = "Close",
+                                    tint = OnSurfaceVariant,
+                                    modifier = Modifier.size(16.dp)
+                                )
                             }
                         }
-                        // Status indicator
+
+                        // Status dot
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                             verticalAlignment = Alignment.CenterVertically
@@ -247,41 +254,82 @@ class FloatingOverlayService : Service(), LifecycleOwner, SavedStateRegistryOwne
                             Text(
                                 text = if (autoAccept) "ACTIVE" else "INACTIVE",
                                 color = if (autoAccept) GreenAccent else RedAccent,
-                                fontSize = 12.sp,
+                                fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
                             )
                         }
+
                         HorizontalDivider(color = SurfaceVariant)
-                        // START button
+
+                        // START
                         Button(
                             onClick = {
                                 AppState.setAutoAccept(true)
                                 AppPreferences.setAutoAccept(this@FloatingOverlayService, true)
                                 AppState.appendLog("▶ [Overlay] Auto-accept STARTED")
                             },
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(40.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = GreenAccent),
-                            contentPadding = PaddingValues(vertical = 8.dp)
+                            contentPadding = PaddingValues(horizontal = 8.dp)
                         ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(16.dp), tint = Color.Black)
                             Spacer(Modifier.width(4.dp))
-                            Text("START / تشغيل", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                            Text("START / تشغيل", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.Black)
                         }
-                        // STOP button
+
+                        // STOP
                         Button(
                             onClick = {
                                 AppState.setAutoAccept(false)
                                 AppPreferences.setAutoAccept(this@FloatingOverlayService, false)
                                 AppState.appendLog("⏸ [Overlay] Auto-accept STOPPED")
                             },
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(40.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = RedAccent),
-                            contentPadding = PaddingValues(vertical = 8.dp)
+                            contentPadding = PaddingValues(horizontal = 8.dp)
                         ) {
-                            Icon(Icons.Default.Stop, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Icon(Icons.Default.Stop, null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("STOP / إيقاف", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Text("STOP / إيقاف", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                         }
+
+                        HorizontalDivider(color = SurfaceVariant)
+
+                        // FORCE ACCEPT TEST — taps 85% screen height coordinate
+                        Button(
+                            onClick = {
+                                val svc = DriverHelperAccessibilityService.instance
+                                if (svc != null) {
+                                    AppState.appendLog("🔴 FORCE ACCEPT TEST — gesture at 85%")
+                                    svc.performGestureTap(price = 0f, recordStats = false, yPercent = 0.85f)
+                                    closePanel()
+                                } else {
+                                    AppState.appendLog("❌ FORCE TEST: Accessibility Service not connected!")
+                                }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(44.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB45309)),
+                            contentPadding = PaddingValues(horizontal = 8.dp)
+                        ) {
+                            Icon(Icons.Default.TouchApp, null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("FORCE ACCEPT TEST", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        }
+
+                        // Show service status for quick diagnosis
+                        val svcConnected by AppState.serviceConnected.collectAsState()
+                        Text(
+                            text = if (svcConnected) "● Service: connected" else "● Service: DISCONNECTED",
+                            color = if (svcConnected) GreenAccent else RedAccent,
+                            fontSize = 10.sp,
+                            modifier = Modifier.fillMaxWidth()
+                        )
                     }
                 }
             }
