@@ -18,23 +18,16 @@ import com.smartorders.driverhelper.data.parseTripInfo
 class DriverHelperAccessibilityService : AccessibilityService() {
 
     companion object {
-        // Live instance — used by FloatingOverlayService for force-tap
         @Volatile var instance: DriverHelperAccessibilityService? = null
 
+        private const val OWN_PKG = "com.smartorders.driverhelper"
         private val JEENY_PACKAGES = setOf("com.jeeny.driver", "com.jeeny.drivers")
-
-        // Arabic markers that indicate the Jeeny trip offer sheet
-        private val TRIP_MARKERS = listOf(
-            "قبول العرض",
-            "مشوار داخل المدينة",
-            "مشوار",
-            "استريح",
-            "ستريح",
-            "يبعد"
-        )
         private const val ACCEPT_TEXT = "قبول العرض"
+        private val TRIP_MARKERS = listOf(
+            "قبول العرض", "مشوار داخل المدينة", "مشوار", "استريح", "ستريح", "يبعد"
+        )
         private const val COOLDOWN_MS = 4000L
-        private var lastClickTime = 0L
+        @Volatile private var lastClickTime = 0L
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -43,7 +36,7 @@ class DriverHelperAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         AppState.setServiceConnected(true)
-        AppState.appendLog("✅ Accessibility service connected — monitoring ALL windows")
+        AppState.appendLog("✅ Service ON — listening to ALL packages (typeAllMask)")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -53,114 +46,87 @@ class DriverHelperAccessibilityService : AccessibilityService() {
         val evtType = eventTypeName(event.eventType)
         val cls = event.className?.toString() ?: ""
 
-        // Count every event and track last seen
-        AppState.updateDebug {
-            copy(
-                totalEvents = totalEvents + 1,
-                lastPackage = pkg,
-                lastEventType = evtType,
-                lastClassName = cls
-            )
+        // ── 1. Track in AppState — own-pkg filtering done inside AppState ──
+        AppState.onAccessibilityEvent(pkg, evtType, cls)
+
+        // ── 2. If this is a Jeeny event, log it prominently ──
+        val isJeeny = JEENY_PACKAGES.contains(pkg) || pkg.contains("jeeny", ignoreCase = true)
+        if (isJeeny) {
+            AppState.appendLog("📡 JEENY EVENT: $evtType | cls=$cls")
         }
 
-        // ── Scan ALL open windows on every event (not just Jeeny events) ──
-        // This is critical: the trip sheet may fire events under any package
-        val windowDump = scanAllWindows()
-        val allText = windowDump.text
-
+        // ── 3. On EVERY event, scan ALL open windows for Jeeny trip content ──
+        //    (The trip sheet can be visible even if the triggering event is from another pkg)
+        val allText = collectAllWindowsText()
         if (allText.isNotBlank()) {
-            AppState.updateDebug { copy(lastVisibleText = allText.take(600)) }
+            AppState.updateWindowText(allText)
         }
 
-        // Detect Jeeny trip screen by Arabic text markers
-        val hasJeenyScreen = isJeenyTripScreen(allText)
-        AppState.updateDebug { copy(jeenyDetected = hasJeenyScreen) }
+        val jeenyDetected = isJeenyTripScreen(allText)
+        AppState.updateJeenyDetected(jeenyDetected, if (jeenyDetected) allText else "")
 
-        // Log detailed window dump only when Jeeny screen detected (avoid spam)
-        if (hasJeenyScreen) {
-            AppState.appendLog("🟢 JEENY TRIP SCREEN DETECTED")
-            AppState.appendLog("📦 Pkg=${pkg} evt=${evtType}")
-            AppState.appendLog("📝 Text preview: ${allText.take(120)}")
-        }
+        if (!jeenyDetected) return
 
-        if (!hasJeenyScreen) return
+        // ── 4. Trip screen detected ──
+        AppState.appendLog("🟢 TRIP SCREEN DETECTED | pkg=$pkg")
+        AppState.appendLog("   text: ${allText.take(100)}")
 
-        // Auto-accept gate
-        if (!AppPreferences.isAutoAccept(this)) {
-            // Don't log repeatedly — only log once when first seen without auto-accept
-            return
-        }
+        if (!AppPreferences.isAutoAccept(this)) return
 
         val now = System.currentTimeMillis()
         if (now - lastClickTime < COOLDOWN_MS) return
-
-        // Parse trip data
-        val trip = parseTripInfo(allText)
-        if (trip == null) {
-            AppState.appendLog("⚠ Trip screen found but couldn't parse price/distance — raw: ${allText.take(80)}")
-            // Still attempt click even without parsed data — don't bail
-            lastClickTime = now
-            attemptAcceptClick(0f, autoAccepted = false)
-            return
-        }
-
-        AppState.appendLog("📋 Trip: ﷼${trip.price} | ${trip.pickupMinutes}min | ${trip.pickupDistanceKm}km")
-        AppState.onTripDetected(trip.price)
-        AppPreferences.incrementDetected(this)
-
-        // Evaluate rules
-        val minPrice   = AppPreferences.getMinPrice(this)
-        val maxPrice   = AppPreferences.getMaxPrice(this)
-        val minMin     = AppPreferences.getMinPickupMinutes(this)
-        val maxMin     = AppPreferences.getMaxPickupMinutes(this)
-        val maxDist    = AppPreferences.getMaxPickupDistance(this)
-
-        val priceOk  = trip.price in minPrice..maxPrice
-        val minOk    = trip.pickupMinutes in minMin..maxMin
-        val distOk   = trip.pickupDistanceKm <= maxDist
-
-        AppState.appendLog("📊 price=$priceOk min=$minOk dist=$distOk")
-
-        if (!priceOk || !minOk || !distOk) {
-            AppState.appendLog("❌ Rejected by rules")
-            AppState.onTripRejected()
-            AppPreferences.incrementRejected(this)
-            return
-        }
-
-        AppState.appendLog("✅ Rules matched — clicking accept…")
         lastClickTime = now
-        attemptAcceptClick(trip.price, autoAccepted = true)
+
+        val trip = parseTripInfo(allText)
+        if (trip != null) {
+            AppState.appendLog("💰 Trip: ﷼${trip.price} | ${trip.pickupMinutes}min | ${trip.pickupDistanceKm}km")
+            AppState.onTripDetected(trip.price)
+            AppPreferences.incrementDetected(this)
+
+            val priceOk = trip.price in AppPreferences.getMinPrice(this)..AppPreferences.getMaxPrice(this)
+            val minOk   = trip.pickupMinutes in AppPreferences.getMinPickupMinutes(this)..AppPreferences.getMaxPickupMinutes(this)
+            val distOk  = trip.pickupDistanceKm <= AppPreferences.getMaxPickupDistance(this)
+
+            if (!priceOk || !minOk || !distOk) {
+                AppState.appendLog("❌ Rejected: price=$priceOk min=$minOk dist=$distOk")
+                AppState.onTripRejected()
+                AppPreferences.incrementRejected(this)
+                return
+            }
+            AppState.appendLog("✅ Rules OK — clicking…")
+            attemptAcceptClick(trip.price, recordStats = true)
+        } else {
+            // Detected screen but can't parse — still try to click
+            AppState.appendLog("⚠ Could not parse trip — attempting click anyway")
+            attemptAcceptClick(0f, recordStats = false)
+        }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Window scanning — reads ALL open windows, logs package + class + text
-    // ─────────────────────────────────────────────────────────────────────────
-    data class WindowDump(val text: String)
-
-    private fun scanAllWindows(): WindowDump {
+    // ──────────────────────────────────────────────────────────────────────────
+    // Collect text from ALL open windows (not just active window)
+    // ──────────────────────────────────────────────────────────────────────────
+    private fun collectAllWindowsText(): String {
         val sb = StringBuilder()
         try {
             val wins: List<AccessibilityWindowInfo>? = windows
             if (!wins.isNullOrEmpty()) {
                 for (win in wins) {
-                    val root = win.root ?: continue
-                    val winPkg = try { root.packageName?.toString() ?: "" } catch (_: Exception) { "" }
+                    val root = try { win.root } catch (_: Exception) { null } ?: continue
                     collectNodeText(root, sb)
-                    root.recycle()
+                    try { root.recycle() } catch (_: Exception) {}
                 }
             } else {
-                // Fallback: rootInActiveWindow
-                val root = rootInActiveWindow
+                // Fallback to rootInActiveWindow
+                val root = try { rootInActiveWindow } catch (_: Exception) { null }
                 if (root != null) {
                     collectNodeText(root, sb)
-                    root.recycle()
+                    try { root.recycle() } catch (_: Exception) {}
                 }
             }
         } catch (e: Exception) {
-            AppState.appendLog("⚠ scanAllWindows: ${e.message}")
+            AppState.appendLog("⚠ collectWindows: ${e.message?.take(60)}")
         }
-        return WindowDump(sb.toString().trim())
+        return sb.toString().trim()
     }
 
     private fun collectNodeText(node: AccessibilityNodeInfo, sb: StringBuilder, depth: Int = 0) {
@@ -178,126 +144,118 @@ class DriverHelperAccessibilityService : AccessibilityService() {
         } catch (_: Exception) {}
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Jeeny screen detection
-    // ─────────────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────────────
+    // Detection
+    // ──────────────────────────────────────────────────────────────────────────
     private fun isJeenyTripScreen(text: String): Boolean {
         if (text.isBlank()) return false
-        val hasAcceptBtn = text.contains(ACCEPT_TEXT)
-        val hasMarker = TRIP_MARKERS.any { text.contains(it) }
-        val hasPrice = text.contains("﷼") || text.contains("ر.س") ||
-                Regex("""\d+[.,]\d+""").containsMatchIn(text)
-        return (hasAcceptBtn || hasMarker) && hasPrice
+        val hasAccept  = text.contains(ACCEPT_TEXT)
+        val hasMarker  = TRIP_MARKERS.any { text.contains(it) }
+        val hasPrice   = text.contains("﷼") || text.contains("ر.س") ||
+                         Regex("""\d+[.,]\d+""").containsMatchIn(text)
+        return (hasAccept || hasMarker) && hasPrice
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Click logic — node first, then gesture fallback automatically
-    // ─────────────────────────────────────────────────────────────────────────
-    fun attemptAcceptClick(price: Float, autoAccepted: Boolean = true) {
-        val nodeClicked = tryNodeClick()
-        if (nodeClicked) {
+    // ──────────────────────────────────────────────────────────────────────────
+    // Click — node first, gesture fallback automatically
+    // ──────────────────────────────────────────────────────────────────────────
+    fun attemptAcceptClick(price: Float, recordStats: Boolean) {
+        val nodeOk = tryNodeClick()
+        if (nodeOk) {
             AppState.appendLog("✅ Node click SUCCESS")
             AppState.updateDebug { copy(acceptButtonFound = true, clickMethod = "node click", clickSuccess = true) }
-            if (autoAccepted) {
+            if (recordStats && price > 0f) {
                 AppState.onTripAccepted(price)
                 AppPreferences.incrementAccepted(this)
                 AppPreferences.addToTotalSar(this, price)
             }
         } else {
-            AppState.appendLog("⚠ Node click failed → gesture fallback")
+            AppState.appendLog("⚠ Node click failed → gesture at 85%")
             AppState.updateDebug { copy(clickMethod = "gesture fallback") }
-            performGestureTap(price, autoAccepted, yPercent = 0.85f)
+            performGestureTap(price, recordStats, yPercent = 0.85f)
         }
     }
 
     private fun tryNodeClick(): Boolean {
         try {
-            // Try all windows first
             val wins = windows
             if (!wins.isNullOrEmpty()) {
                 for (win in wins) {
-                    val root = win.root ?: continue
-                    val hit = findAndClickNode(root)
+                    val root = try { win.root } catch (_: Exception) { null } ?: continue
+                    val hit = findAndClick(root)
                     try { root.recycle() } catch (_: Exception) {}
                     if (hit) return true
                 }
             }
-            // Fallback
-            val root = rootInActiveWindow ?: return false
-            val hit = findAndClickNode(root)
+            val root = try { rootInActiveWindow } catch (_: Exception) { null } ?: return false
+            val hit = findAndClick(root)
             try { root.recycle() } catch (_: Exception) {}
             return hit
         } catch (e: Exception) {
-            AppState.appendLog("⚠ tryNodeClick ex: ${e.message}")
+            AppState.appendLog("⚠ tryNodeClick: ${e.message?.take(60)}")
             return false
         }
     }
 
-    private fun findAndClickNode(root: AccessibilityNodeInfo): Boolean {
-        // Exact text match for accept button
-        val nodes = try { root.findAccessibilityNodeInfosByText(ACCEPT_TEXT) } catch (_: Exception) { null }
-        if (!nodes.isNullOrEmpty()) {
+    private fun findAndClick(root: AccessibilityNodeInfo): Boolean {
+        AppState.updateDebug { copy(acceptButtonFound = false) }
+        // 1. findAccessibilityNodeInfosByText
+        val byText = try { root.findAccessibilityNodeInfosByText(ACCEPT_TEXT) } catch (_: Exception) { null }
+        if (!byText.isNullOrEmpty()) {
             AppState.updateDebug { copy(acceptButtonFound = true) }
-            for (node in nodes) {
-                val clicked = clickNodeOrParent(node)
-                try { node.recycle() } catch (_: Exception) {}
-                if (clicked) return true
+            for (n in byText) {
+                if (clickNodeOrParent(n)) { try { n.recycle() } catch (_: Exception) {}; return true }
+                try { n.recycle() } catch (_: Exception) {}
             }
         }
-        // Also try recursive search for any clickable node with the accept text
-        return findClickableRecursive(root, ACCEPT_TEXT)
+        // 2. Recursive deep search
+        return searchAndClick(root, 0)
     }
 
-    private fun findClickableRecursive(node: AccessibilityNodeInfo, target: String, depth: Int = 0): Boolean {
-        if (depth > 30) return false
+    private fun searchAndClick(node: AccessibilityNodeInfo, depth: Int): Boolean {
+        if (depth > 35) return false
         try {
             val text = node.text?.toString() ?: ""
             val desc = node.contentDescription?.toString() ?: ""
-            if ((text.contains(target) || desc.contains(target))) {
+            if (text.contains(ACCEPT_TEXT) || desc.contains(ACCEPT_TEXT)) {
+                AppState.updateDebug { copy(acceptButtonFound = true) }
                 if (clickNodeOrParent(node)) return true
             }
             for (i in 0 until node.childCount) {
                 val child = try { node.getChild(i) } catch (_: Exception) { null } ?: continue
-                if (findClickableRecursive(child, target, depth + 1)) {
-                    try { child.recycle() } catch (_: Exception) {}
-                    return true
-                }
+                val found = searchAndClick(child, depth + 1)
                 try { child.recycle() } catch (_: Exception) {}
+                if (found) return true
             }
         } catch (_: Exception) {}
         return false
     }
 
     private fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
-        if (node.isClickable) {
-            return try { node.performAction(AccessibilityNodeInfo.ACTION_CLICK) } catch (_: Exception) { false }
-        }
-        var current: AccessibilityNodeInfo? = try { node.parent } catch (_: Exception) { null }
+        if (node.isClickable) return try { node.performAction(AccessibilityNodeInfo.ACTION_CLICK) } catch (_: Exception) { false }
+        var cur: AccessibilityNodeInfo? = try { node.parent } catch (_: Exception) { null }
         repeat(6) {
-            val c = current ?: return false
+            val c = cur ?: return false
             if (c.isClickable) {
-                val result = try { c.performAction(AccessibilityNodeInfo.ACTION_CLICK) } catch (_: Exception) { false }
+                val ok = try { c.performAction(AccessibilityNodeInfo.ACTION_CLICK) } catch (_: Exception) { false }
                 try { c.recycle() } catch (_: Exception) {}
-                return result
+                return ok
             }
-            val parent = try { c.parent } catch (_: Exception) { null }
+            val p = try { c.parent } catch (_: Exception) { null }
             try { c.recycle() } catch (_: Exception) {}
-            current = parent
+            cur = p
         }
-        try { current?.recycle() } catch (_: Exception) {}
+        try { cur?.recycle() } catch (_: Exception) {}
         return false
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Gesture tap — called as fallback OR from Force Test button
-    // ─────────────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────────────
+    // Gesture tap — also callable from floating panel (Force Test)
+    // ──────────────────────────────────────────────────────────────────────────
     fun performGestureTap(price: Float = 0f, recordStats: Boolean = false, yPercent: Float = 0.85f) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
-            AppState.appendLog("❌ Gestures require Android 7+")
-            AppState.updateDebug { copy(clickSuccess = false) }
-            return
+            AppState.appendLog("❌ Gesture requires Android 7+"); return
         }
-
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val dm = DisplayMetrics()
         @Suppress("DEPRECATION")
@@ -305,8 +263,7 @@ class DriverHelperAccessibilityService : AccessibilityService() {
 
         val tapX = (dm.widthPixels / 2).toFloat()
         val tapY = dm.heightPixels * yPercent
-
-        AppState.appendLog("🎯 Gesture tap → (${tapX.toInt()}, ${tapY.toInt()}) on ${dm.widthPixels}×${dm.heightPixels} [y=${(yPercent*100).toInt()}%]")
+        AppState.appendLog("🎯 Gesture → (${tapX.toInt()}, ${tapY.toInt()}) on ${dm.widthPixels}×${dm.heightPixels}")
 
         val path = Path().apply { moveTo(tapX, tapY) }
         val gesture = GestureDescription.Builder()
@@ -314,16 +271,16 @@ class DriverHelperAccessibilityService : AccessibilityService() {
             .build()
 
         dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription) {
+            override fun onCompleted(g: GestureDescription) {
                 AppState.appendLog("✅ Gesture COMPLETED")
-                AppState.updateDebug { copy(clickSuccess = true, clickMethod = "gesture tap ${(yPercent*100).toInt()}%") }
+                AppState.updateDebug { copy(clickSuccess = true, clickMethod = "gesture ${(yPercent * 100).toInt()}%") }
                 if (recordStats && price > 0f) {
                     AppState.onTripAccepted(price)
                     AppPreferences.incrementAccepted(this@DriverHelperAccessibilityService)
                     AppPreferences.addToTotalSar(this@DriverHelperAccessibilityService, price)
                 }
             }
-            override fun onCancelled(gestureDescription: GestureDescription) {
+            override fun onCancelled(g: GestureDescription) {
                 AppState.appendLog("❌ Gesture CANCELLED — check overlay permission")
                 AppState.updateDebug { copy(clickSuccess = false) }
             }
@@ -331,12 +288,13 @@ class DriverHelperAccessibilityService : AccessibilityService() {
     }
 
     private fun eventTypeName(type: Int): String = when (type) {
-        AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED  -> "WIN_STATE"
+        AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED   -> "WIN_STATE"
         AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> "WIN_CONTENT"
         AccessibilityEvent.TYPE_WINDOWS_CHANGED        -> "WINS_CHANGED"
         AccessibilityEvent.TYPE_VIEW_CLICKED           -> "VIEW_CLICK"
         AccessibilityEvent.TYPE_VIEW_FOCUSED           -> "VIEW_FOCUS"
-        else -> "TYPE_$type"
+        AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED      -> "TEXT_CHANGED"
+        else -> "TYPE_${type}"
     }
 
     override fun onInterrupt() {
