@@ -1,0 +1,14 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+app/build/
+*.apk
+!app/src/main/res/mipmap-anydpi-v26/
+gradle/wrapper/gradle-wrapper.jar
