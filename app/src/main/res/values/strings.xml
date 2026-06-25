@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Smart Orders Driver Helper</string>
+    <string name="accessibility_service_label">Smart Orders Accessibility Service</string>
+    <string name="accessibility_service_description">Reads Jeeny Driver trip requests and auto-accepts them based on your rules.</string>
+</resources>
